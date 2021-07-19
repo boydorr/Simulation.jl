@@ -64,13 +64,13 @@ include("Biodiversity/Landscape.jl")
 export GridLandscape, CachedGridLandscape
 
 include("Transitions/Transitions.jl")
-export TransitionList, create_transition_list, addtransition!
+export TransitionList, create_transition_list, addtransition!, getprob
 
 include("Epidemiology/MedianGenerator.jl")
 export MedianGenerator
 
 include("Epidemiology/data_utils.jl")
-export parse_hdf5, get_3d_km_grid_axis_array
+export parse_hdf5, get_3d_km_grid_axis_array, get_bng, get_en
 
 include("Epidemiology/EpiControl.jl")
 export NoControl, Lockdown
@@ -152,10 +152,10 @@ export BirthProcess, DeathProcess, GenerateSeed, AllDisperse, SeedDisperse,
 UpdateEnergy, UpdateEnvironment, update_environment!
 
 include("Transitions/EpiTransitions.jl")
-export ForceProduce, ForceDisperse, ViralLoad, Exposure, EnvExposure, Infection,
+export ForceProduce, ForceDisperse, ViralLoad, EnvViralLoad, Exposure, Infection,
 DevelopSymptoms, Hospitalise, DeathFromInfection,
 Recovery, SeedInfection, UpdateEpiEnvironment, update_epi_environment!,
-get_env
+get_env, deterministic_seed!
 
 include("Transitions/BiodiversityRun.jl")
 include("Transitions/EpiRun.jl")

@@ -11,6 +11,19 @@ mutable struct ViralLoad <: AbstractStateTransition
 end
 
 """
+    EnvViralLoad <: AbstractStateTransition
+
+Transition for force of infection to settle into environmental reservoir,
+influenced by the local environment, accessed through `get_env`.
+
+"""
+mutable struct EnvViralLoad <: AbstractStateTransition
+    location::Int64
+    prob::DayType
+    get_env::Function
+end
+
+"""
     Exposure <: AbstractStateTransition
 
 Transition for exposure of susceptibles to force of infection
@@ -25,31 +38,7 @@ mutable struct Exposure <: AbstractStateTransition
     virus_prob::DayType
 end
 
-"""
-    EnvExposure <: AbstractStateTransition
-
-Transition for exposure of susceptibles to force of infection
-    and environmental reservoir at set probabilities,
-    `force_prob` and `virus_prob` respectively. This exposure
-    mechanism is influenced by the local environment (fetched
-    through the `get_env` function), controlled by the strength
-    of `env_param`.
-"""
-mutable struct EnvExposure <: AbstractStateTransition
-    species::Int64
-    location::Int64
-    destination::Int64
-    force_prob::DayType
-    virus_prob::DayType
-    env_param::Float64
-    get_env::Function
-end
-
 function getprob(rule::Exposure)
-    return rule.force_prob, rule.virus_prob
-end
-
-function getprob(rule::EnvExposure)
     return rule.force_prob, rule.virus_prob
 end
 
@@ -155,6 +144,9 @@ habitat type.
 function get_env(habitat::A) where A <: AbstractHabitat
     return habitat.matrix
 end
+function get_env(habitat::A, loc::Int64) where A <: AbstractHabitat
+    return habitat.matrix[loc]
+end
 
 """
     SeedInfection <: AbstractWindDown
@@ -186,14 +178,13 @@ function update_virus_cache!(epi::Ecosystem)
     force_cats = epi.spplist.pathogens.force_cats
     human_to_force = epi.spplist.species.human_to_force
     locs = size(virus(epi.abundances), 2)
-    vm = zeros(eltype(epi.cache.virusmigration), length(force_cats), locs)
     classes = length(epi.spplist.species.names)
     Threads.@threads for i in 1:classes
         for j in 1:locs
-            vm[human_to_force[i], j] += epi.cache.virusmigration[i, j]
+            epi.cache.forcemigration[human_to_force[i], j] += epi.cache.virusmigration[i, j]
         end
     end
-    virus(epi.abundances)[force_cats, :] .= vm
+    virus(epi.abundances)[force_cats, :] .= epi.cache.forcemigration
 end
 
 """
@@ -206,4 +197,29 @@ function update_epi_environment!(epi::Ecosystem, timestep::Unitful.Time)
     update_virus_cache!(epi)
     # Invalidate all caches for next update
     invalidatecaches!(epi)
+    # Update environment - habitat and energy budgets
+    habitatupdate!(epi, timestep)
+    applycontrols!(epi, timestep)
+end
+
+
+function deterministic_seed!(epi::Ecosystem, controls::Lockdown, timestep::Unitful.Time)
+    rng = epi.abundances.rngs[Threads.threadid()]
+    if (epi.cache.initial_infected > 0) && (controls.current_date < controls.lockdown_date)
+        inf = rand(rng, Poisson(epi.cache.initial_infected * timestep /controls.lockdown_date))
+        sus_id = epi.spplist.species.susceptible
+        exp_id = sus_id .+ length(epi.spplist.species.susceptible)
+        pos = epi.cache.ordered_active[1:inf]
+        for i in sus_id 
+            for j in eachindex(pos)
+                if (human(epi.abundances)[sus_id[i], pos[j]] >= 1)
+                    human(epi.abundances)[sus_id[i], pos[j]] -= 1
+                    human(epi.abundances)[exp_id[i], pos[j]] += 1
+                end
+            end
+        end
+    elseif controls.current_date == controls.lockdown_date
+        @info "Lockdown initiated - $(sum(human(epi.abundances)[epi.spplist.species.susceptible .+ length(epi.spplist.species.susceptible), :])) individuals infected"
+    end
+    return controls
 end

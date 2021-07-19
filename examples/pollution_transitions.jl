@@ -13,11 +13,33 @@ using DataFrames
 using Plots
 using SQLite
 
-function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, timestep::Unitful.Time; do_plot::Bool = false, do_download::Bool = true, save::Bool = false, savepath::String = pwd())
+module PollutionRun
+    using EcoSISTEM
+    using Statistics
+    import EcoSISTEM.getprob
+    # Define how probabilities for transitions should be altered by pollution
+    getprob(eco::Ecosystem, rule::Exposure) = (rule.force_prob * 5.0 * get_env(eco.abenv.habitat, rule.location), rule.virus_prob)
+    getprob(eco::Ecosystem, rule::DevelopSymptoms) = rule.prob * 2.0 * get_env(eco.abenv.habitat, rule.location)
+    getprob(eco::Ecosystem, rule::Hospitalise) = rule.prob * 2.0 * get_env(eco.abenv.habitat, rule.location)
+    getprob(eco::Ecosystem, rule::DeathFromInfection) = rule.prob * 5.0 * get_env(eco.abenv.habitat, rule.location)
+    export getprob
+end
+using Main.PollutionRun
 
+const stochasticmode = false
+
+function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, timestep::Unitful.Time; do_plot::Bool = false, save::Bool = false, savepath::String = pwd(), death_boost::Float64 = 2.0)
     # Download and read in population sizes for Scotland
-    DataRegistryUtils.load_array!(db, "human/demographics/population/scotland", "/grid1km/age/persons"; sql_alias="human_demographics_population_scotland_grid1km_age_persons_arr")
-    scotpop = get_3d_km_grid_axis_array(db, ["grid_x", "grid_y", "age_aggr"], "val", "scottish_population_view")
+    DataRegistryUtils.load_array!(db, "human/demographics/population/scotland", "/grid area/age/persons"; sql_alias="km_age_persons_arr")
+    scotpop = get_3d_km_grid_axis_array(db, ["grid_area", "age_aggr"], "val", "scottish_population_view")
+    scotpop = shrink_to_active(scotpop)
+
+    DataRegistryUtils.load_array!(db, "records/pollution", "/array"; sql_alias="records_pollution_array_arr")
+    pollution = get_3d_km_grid_axis_array(db, ["grid_x", "grid_y"], "val", "pollution_grid_view", 1.0μg * m^-3)
+    pollution = pollution[531500m .. 1215000m, 54500m .. 465000m]
+    
+    rngtype = stochasticmode ? Random.MersenneTwister : MedianGenerator
+    seed_fun = stochasticmode ? seedinfected! : deterministic_seed!
 
     # Read number of age categories
     age_categories = size(scotpop, 3)
@@ -48,14 +70,6 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
         2 * AxisArrays.axes(scotpop, 1)[1]) *
         (AxisArrays.axes(scotpop, 2)[end] + AxisArrays.axes(scotpop, 2)[2] -
         2 * AxisArrays.axes(scotpop, 2)[1]) * 1.0
-
-    # Sum up age categories and turn into simple matrix
-    total_pop = dropdims(sum(Float64.(scotpop), dims=3), dims=3)
-    total_pop = AxisArray(total_pop, AxisArrays.axes(scotpop)[1], AxisArrays.axes(scotpop)[2])
-    total_pop.data[total_pop .≈ 0.0] .= NaN
-
-    # Shrink to smallest bounding box. The NaNs are inactive.
-    total_pop = shrink_to_active(total_pop);
 
     # Prob of developing symptoms
     p_s = fill(read_estimate(db,
@@ -97,7 +111,6 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
         data_type=Float64
     )[1] * Unitful.hr)
     @show T_asym
-
 
     # Time pre-symptomatic
     T_presym = 1.5days
@@ -172,9 +185,12 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
         (from="Hospitalised", from_id=cat_idx[:, 6], to="Dead", to_id=cat_idx[:, 8], prob=death_hospital)
     ])
 
-    epienv = simplehabitatAE(298.0K, size(total_pop), area, Lockdown(20days))
-
-    movement_balance = (home = fill(0.5, numclasses * age_categories), work = fill(0.5, numclasses * age_categories))
+    total_pop = dropdims(sum(Float64.(scotpop), dims=3), dims=3)
+    total_pop[total_pop .≈ 0.0] .= NaN
+    axis1 = pollution.axes[1]; axis2 = pollution.axes[2]
+    poll = pollution ./ mean(pollution)
+    pollution = AxisArray(poll, axis1, axis2)
+    epienv = ukclimateAE(pollution, area, Lockdown(20days))
 
     # Dispersal kernels for virus and disease classes
     dispersal_dists = fill(1.0km, length(total_pop))
@@ -185,7 +201,7 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
     # Import commuter data (for now, fake table)
     active_cells = findall(.!isnan.(total_pop[1:end]))
     from = active_cells
-    to = sample(active_cells, weights(total_pop[active_cells]), length(active_cells))
+    to = sample(rngtype(), active_cells, weights(total_pop[active_cells]), length(active_cells))
     count = round.(total_pop[to]/10)
     home_to_work = DataFrame(from=from, to=to, count=count)
     work = Commuting(home_to_work)
@@ -193,17 +209,19 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
 
     # Traits for match to environment (turned off currently through param choice, i.e. virus matches environment perfectly)
     traits = GaussTrait(fill(298.0K, numvirus), fill(0.1K, numvirus))
+    movement_balance = (home = fill(0.5, numclasses * age_categories), work = fill(0.5, numclasses * age_categories))
     epilist = SpeciesList(traits, abun_v, abun_h, movement, transitiondat, param, age_categories, movement_balance)
     rel = Gauss{eltype(epienv.habitat)}()
 
     transitions = create_transition_list()
     addtransition!(transitions, UpdateEpiEnvironment(update_epi_environment!))
-    addtransition!(transitions, SeedInfection(seedinfected!))
+    addtransition!(transitions, SeedInfection(seed_fun))
 
-    initial_infecteds = 100
+    initial_infecteds = 10_000
+
     # Create epi system with all information
-    @time epi = Ecosystem(epilist, epienv, rel, total_pop, UInt32(1),
-    initial_infected = initial_infecteds, transitions = transitions)
+    @time epi = Ecosystem(epilist, epienv, rel, scotpop, UInt32(1),
+    initial_infected = initial_infecteds, transitions = transitions, rngtype = rngtype)
 
     for loc in epi.cache.ordered_active
         addtransition!(epi.transitions, ViralLoad(loc, param.virus_decay))
@@ -216,8 +234,8 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
             addtransition!(epi.transitions, ForceDisperse(cat_idx[age, 4], loc))
             addtransition!(epi.transitions, ForceDisperse(cat_idx[age, 5], loc))
             # Exposure
-            addtransition!(epi.transitions, Exposure(transitiondat[1, :from_id][age], loc,
-                transitiondat[1, :to_id][age], transitiondat[1, :prob].force[age], transitiondat[1, :prob].env[age]))
+            addtransition!(epi.transitions, Exposure(transitiondat[1, :from_id][age], loc, transitiondat[1, :to_id][age],
+                transitiondat[1, :prob].force[age], transitiondat[1, :prob].env[age]))
             # Infected but asymptomatic
             addtransition!(epi.transitions, Infection(transitiondat[2, :from_id][age], loc,
                 transitiondat[2, :to_id][age], transitiondat[2, :prob][age]))
@@ -247,15 +265,12 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
                 transitiondat[10, :to_id][age], transitiondat[10, :prob][age]))
         end
     end
-
-    # Populate susceptibles according to actual population spread
-    scotpop = shrink_to_active(scotpop)
-    reshaped_pop =
-        reshape(scotpop[1:size(epienv.active, 1), 1:size(epienv.active, 2), :],
-                size(epienv.active, 1) * size(epienv.active, 2), size(scotpop, 3))'
-    epi.abundances.matrix[cat_idx[:, 1], :] = reshaped_pop
-
-    N_cells = size(epi.abundances.matrix, 2)
+    
+    # Store BNG names in abenv
+    norths = ustrip.(AxisArrays.axes(scotpop)[1].val)
+    easts = ustrip.(AxisArrays.axes(scotpop)[2].val)
+    n_e = collect(Base.product(norths, easts))[1:end]
+    epi.abenv.names = [get_bng(n[2], n[1]) for n in n_e]
 
     # Turn off work moves for <20s and >70s
     epi.spplist.species.home_balance[cat_idx[1:2, :]] .= 1.0
@@ -263,6 +278,8 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
     epi.spplist.species.work_balance[cat_idx[1:2, :]] .= 0.0
     epi.spplist.species.work_balance[cat_idx[7:10, :]] .= 0.0
 
+    N_cells = size(epi.abundances.matrix, 2)
+    println("Ecosystem initiated")
     # Run simulation
     abuns = zeros(UInt32, size(epi.abundances.matrix, 1), N_cells, floor(Int, times/timestep) + 1)
     @time simulate_record!(abuns, epi, times, interval, timestep, save = save, save_path = savepath)
@@ -283,20 +300,17 @@ function run_model(db::SQLite.DB, times::Unitful.Time, interval::Unitful.Time, t
             "Deaths" => cat_idx[:, 8],
         )
         display(plot_epidynamics(epi, abuns, category_map = category_map))
-        display(plot_epiheatmaps(epi, abuns, steps = [30]))
+        display(plot_epiheatmaps(epi, abuns, steps = [30], match_dimensions = false))
     end
     return abuns
 end
 
+cd("examples")
 data_dir= "Epidemiology/data/"
 config = "Epidemiology/data_config.yaml"
 view_sql = "Epidemiology/Scotland_run_view.sql"
 db = initialise_local_registry(data_dir, data_config = config, sql_file = view_sql)
 
 times = 1month; interval = 1day; timestep = 1day
-run_model(db, times, interval, timestep, do_plot = true)
-
-#
-# pollution = parse_pollution(api)
-# pollution = pollution[5513m .. 470513m, 531500m .. 1221500m, "pm2-5"]
-# ukclimateAE(pollution, size(total_pop), area, fill(true, total_pop), Lockdown(20days))
+run_model(db, 1day, interval, timestep)
+run_model(db, times, interval, timestep, save = true, do_plot = true)

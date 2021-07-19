@@ -21,8 +21,6 @@ function run_rule!(eco::Ecosystem, rule::R, timestep::Unitful.Time) where R <: A
         _run_rule!(eco, rule, timestep)
     elseif typeof(rule) == Exposure
         _run_rule!(eco, rule, timestep)
-    elseif typeof(rule) == EnvExposure
-        _run_rule!(eco, rule, timestep)
     elseif typeof(rule) == Infection
         _run_rule!(eco, rule, timestep)
     elseif typeof(rule) == DevelopSymptoms
@@ -34,6 +32,8 @@ function run_rule!(eco::Ecosystem, rule::R, timestep::Unitful.Time) where R <: A
     elseif typeof(rule) == Recovery
         _run_rule!(eco, rule, timestep)
     elseif typeof(rule) == ViralLoad
+        _run_rule!(eco, rule, timestep)
+    elseif typeof(rule) == EnvViralLoad
         _run_rule!(eco, rule, timestep)
     elseif typeof(rule) == ForceProduce
         _run_rule!(eco, rule, timestep)
@@ -220,16 +220,9 @@ function simulate_record!(
 
   # - initialise and save the first timestep abuns/storage to HDF5
   # construct axes for abuns/storage matrix
-  ax = AxisArrays.axes(eco.abundances.grid)[end-1:end]
-  grid_id = map(Iterators.product(ax...)) do (x,y)
-      return string.(x, "-", y)
-  end
-  # TODO: confirm converting `grid_id` from matrix to vector in the way below gives the
-  # correct order assumed in the model
-  grid_id = vec(grid_id)
   axes = (;
       compartment = getnames(eco.spplist),
-      grid_id = grid_id,
+      grid_id = eco.abenv.names,
       times = string.(uconvert.(day, 1.0 .* record_seq))
   )
   if save

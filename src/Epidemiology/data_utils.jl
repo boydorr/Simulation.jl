@@ -1,5 +1,6 @@
 using HDF5
 using SQLite
+using BritishNationalGrid
 """
     parse_hdf5(path; grid="10k", component="scotland_2018")
 
@@ -43,31 +44,67 @@ function parse_hdf5(path; grid="10km", component="grid10km/10year/persons")
     return population
 end
 
+function get_en(bng_name::String)
+    bng = BritishNationalGrid.BNGPoint(parse(Int, bng_name[3:4]) * 1000, parse(Int, bng_name[5:6]) * 1000, uppercase(bng_name[1:2]))
+    return bng.e, bng.n
+end
+function get_en(bng_names::Vector{String})
+    ens = get_en.(bng_names)
+    easts = [ens[i][1] for i in eachindex(ens)]
+    norths = [ens[i][2] for i in eachindex(ens)]
+    return easts, norths
+end
+function get_bng(east::Real, north::Real, ref::Int64 = 4)
+    pnt = BNGPoint(east, north)
+    return gridref(pnt, ref, true)
+end
+
+function create_BNG_grid(east::Vector{Int64}, north::Vector{Int64}, vals::Array{T, 1}, ages::Vector{Int64}) where T
+    easts = collect(minimum(east):1_000:maximum(east)) .* m
+    norths = collect(minimum(north):1_000:maximum(north)) .* m
+    grid_a = AxisArray(zeros(typeof(vals[1]), length(norths), length(easts), length(unique(ages))), Axis{:northing}(norths), Axis{:easting}(easts), Axis{:age}(unique(ages)))
+    for i in eachindex(east)
+        grid_a[atvalue(north[i] * m), atvalue(east[i] * m), atvalue(ages[i])] = vals[i]
+    end
+    return grid_a
+end
+function create_BNG_grid(east::Vector{Int64}, north::Vector{Int64}, vals::Array{T, 1}) where T
+    easts = collect(minimum(east):1_000:maximum(east)) .* m
+    norths = collect(minimum(north):1_000:maximum(north)) .* m
+    grid_a = AxisArray(zeros(typeof(vals[1]), length(norths), length(easts)), Axis{:northing}(norths), Axis{:easting}(easts))
+    for i in eachindex(east)
+        grid_a[atvalue(north[i] * m), atvalue(east[i] * m)] = vals[i]
+    end
+    return grid_a
+end
 """
     get_3d_km_grid_axis_array(cn::SQLite.DB, dims::Array{String,1}, msr::String, tbl::String)
 
 Function to take Scottish Population data from an SQLite database and convert to an axis array.
 
 """
-function get_3d_km_grid_axis_array(cn::SQLite.DB, dims::Array{String,1}, msr::String, tbl::String)
+function get_3d_km_grid_axis_array(cn::SQLite.DB, dims::Array{String,1}, msr::String, tbl::String, units = Float64)
     sel_sql = ""
     dim_ax = []
     for i in eachindex(dims)
         sel_sql = string(sel_sql, dims[i], ",")
         dim_st = SQLite.Stmt(cn, string("SELECT DISTINCT ", dims[i], " AS val FROM ", tbl, " ORDER BY ", dims[i]))
         dim_vals = SQLite.DBInterface.execute(dim_st) |> DataFrames.DataFrame
-        av = i < 3 ? [(v)km for v in dim_vals.val] : dim_vals.val   # unit conversion
-        push!(dim_ax, AxisArrays.Axis{Symbol(dims[i])}(av))
+        # av = i < 3 ? [(v)km for v in dim_vals.val] : dim_vals.val   # unit conversion
+        push!(dim_ax, AxisArrays.Axis{Symbol(dims[i])}(dim_vals.val))
     end
     sel_sql = string("SELECT ", sel_sql, " SUM(", msr, ") AS val\nFROM ", tbl, "\nGROUP BY ", rstrip(sel_sql, ','))
     stmt = SQLite.Stmt(cn, sel_sql)
     df = SQLite.DBInterface.execute(stmt) |> DataFrames.DataFrame
-    ## scottish population AxisArray
-    axis_size = Tuple(Int64[length(d) for d in dim_ax])
-    # data = zeros(typeof(df.val[1]), axis_size)
-    output = AxisArrays.AxisArray(zeros(typeof(df.val[1]), axis_size), Tuple(dim_ax))
-    for row in eachrow(df)
-        output[AxisArrays.atvalue(row[Symbol(dims[1])]km), AxisArrays.atvalue(row[Symbol(dims[2])]km), AxisArrays.atvalue(row[Symbol(dims[3])])] = row.val
+    grid_axes = df[!, dims]
+    if tbl == "scottish_population_view"
+        east,north = get_en(grid_axes[!, dims[1]])
+        vals = df[!, msr] * oneunit(units)
+        ages = df[!, dims[2]]
+        output = create_BNG_grid(east, north, vals, ages)
+    else
+        vals = df[!, msr] * oneunit(units)
+        output = create_BNG_grid(grid_axes[!, dims[1]], grid_axes[!, dims[2]], vals)
     end
     return output
 end

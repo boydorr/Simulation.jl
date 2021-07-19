@@ -38,6 +38,7 @@ and a Bool to say if these caches are `valid`.
 """
 mutable struct EpiCache <: AbstractCache
   virusmigration::Array{Float64, 2}
+  forcemigration::Array{Float64, 2}
   initial_infected::Int64
   ordered_active::Vector{Int64}
   valid::Bool
@@ -91,9 +92,18 @@ Function to create an `EpiCache` for a SpeciesList and EpiLandscape.
 """
 function create_cache(sppl::SpeciesList, ml::EpiLandscape)
   vm = zeros(Float64, size(ml.matrix))
-  return EpiCache(vm, false)
+  force_cats = sppl.pathogens.force_cats
+  fm = zeros(Float64, length(force_cats), size(ml.matrix, 2))
+  ordered_active = collect(1:size(ml.matrix, 2))
+  initial_infected = 1
+  return EpiCache(vm, fm, initial_infected, ordered_active, false)
 end
-
+function create_cache(sppl::SpeciesList, ml::EpiLandscape, ordered_active::Vector{Int64}, initial_infected::Int64)
+    vm = zeros(Float64, size(ml.matrix))
+    force_cats = sppl.pathogens.force_cats
+    fm = zeros(Float64, length(force_cats), size(ml.matrix, 2))
+    return EpiCache(vm, fm, initial_infected, ordered_active, false)
+  end
 
 """
     tematch(sppl::SpeciesList, abenv::AbstractAbiotic)
@@ -206,13 +216,13 @@ Function to create an `Ecosystem` with epi categories from a `SpeciesList`, envi
 """
 function Ecosystem(abundances::EpiLandscape{U, VecRNGType}, epilist::EL, epienv::EE,
     ordinariness::Union{Matrix{Float64}, Missing}, relationship::ER, lookup::EpiLookup,
-    vm::Array{Float64, 2}, initial_infected::Int64, valid::Bool, transitions::Union{Nothing, TransitionList}
+     initial_infected::Int64, transitions::Union{Nothing, TransitionList}
     ) where {U <: Integer, VecRNGType <: AbstractVector{<:Random.AbstractRNG},
     EE <: AbstractEpiEnv, EL <: SpeciesList, ER <: AbstractTraitRelationship}
   total_pop = sum(abundances.matrix, dims = 1)[1, :]
   sorted_grid_ids = sortperm(total_pop, rev = true)
   sorted_grid_ids = sorted_grid_ids[total_pop[sorted_grid_ids] .> 0]
-  cache = EpiCache(vm, initial_infected, sorted_grid_ids, valid)
+  cache = create_cache(epilist, abundances, sorted_grid_ids, initial_infected)
   return Ecosystem(abundances, epilist, epienv, ordinariness, relationship, lookup, cache, transitions)
 end
 
@@ -243,8 +253,8 @@ function Ecosystem(popfun::F, epilist::SpeciesList, epienv::GridEpiEnv,
   home_lookup = genlookups(epienv, epilist.species.movement.home)
   work_lookup = genlookups(epienv, epilist.species.movement.work, initial_pop)
   lookup = EpiLookup(home_lookup, work_lookup)
-  vm = zeros(Float64, size(ml.matrix))
-  return Ecosystem(ml, epilist, epienv, missing, rel, lookup, vm, initial_infected, false, transitions)
+
+  return Ecosystem(ml, epilist, epienv, missing, rel, lookup, initial_infected, transitions)
 end
 
 """
@@ -284,36 +294,32 @@ function Ecosystem(epilist::SpeciesList, epienv::GridEpiEnv, rel::AbstractTraitR
         initial_population::A, intnum::U = Int64(1); initial_infected = 0,
         rngtype::Type{R} = Random.MersenneTwister,
         transitions = nothing) where {U <: Integer, A <: AbstractArray, R <: Random.AbstractRNG}
-    if size(initial_population) != size(epienv.active)
+    if (size(epienv.active, 1) ∉ size(initial_population)) |
+        (size(epienv.active, 2) ∉ size(initial_population))
         msg = "size(initial_population)==$(size(initial_population)) != " *
             "size(epienv.active)==$(size(epienv.active))"
         throw(DimensionMismatch(msg))
     end
-    epienv.active .&= .!_inactive.(initial_population)
+
+    epienv.active .&= findactive(initial_population)
 
     # Create matrix landscape of zero abundances
     ml = emptyepilandscape(epienv, epilist, intnum, rngtype)
 
     # Create lookup table of all moves and their probabilities
     home_lookup = genlookups(epienv, epilist.species.movement.home)
-    work_lookup = genlookups(epienv, epilist.species.movement.work, initial_population[1:end])
+    work_lookup = genlookups(epienv, epilist.species.movement.work, initial_population)
     lookup = EpiLookup(home_lookup, work_lookup)
 
-    vm = zeros(Float64, size(ml.matrix))
-
-    epi = Ecosystem(ml, epilist, epienv, missing, rel, lookup, vm, initial_infected, false, transitions)
+    epi = Ecosystem(ml, epilist, epienv, missing, rel, lookup, initial_infected, transitions)
 
     # Add in the initial susceptible population
-    # TODO Need to fix code so it doesn't rely on name of susceptible class
-    idx = findfirst(occursin.("Susceptible", epilist.species.names))
-    if idx == nothing
-        msg = "epilist has no Susceptible category. epilist.names = $(epilist.species.names)"
-        throw(ArgumentError(msg))
-    end
+    idx = epilist.species.susceptible
     # Modify active cells based on new population
     initial_population = convert_population(initial_population, intnum)
-    epi.abundances.grid[idx, :, :] .+= initial_population
-
+    for i in eachindex(idx)
+        epi.abundances.grid[idx[i], :, :] .+= initial_population[:, :, i]
+    end
     total_pop = sum(human(epi.abundances), dims = 1)[1, :]
     sorted_grid_ids = sortperm(total_pop, rev = true)
     sorted_grid_ids = sorted_grid_ids[total_pop[sorted_grid_ids] .> 0]
